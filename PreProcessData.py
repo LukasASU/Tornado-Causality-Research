@@ -1,23 +1,33 @@
 #!/usr/bin/env python3
 """
-Tornado causality pipeline: load -> merge -> preprocess -> PCMCI+.
+STEP 2: preprocessing. Raw data files -> one clean monthly table per outcome.
+
+This script does everything that happens BEFORE the causal algorithm:
+    load each source -> put on a common monthly index -> merge -> remove the seasonal
+    cycle and linear trend (standardized anomalies) -> save.
+It does not import tigramite. The next script (pcmci.py) reads what this one writes.
 
 Expected files in ./Data :
-    1950-2025_SPC.csv   SPC "actual tornadoes" CSV
-    ERA5.nc             ERA5 monthly means: cape, d2m, t2m
-    ERDDAP.csv          ERSST v5 'ssta' for the Gulf box (ERDDAP CSV, with units row)
-    NOAA_SST.txt        monthly Nino indices (YR MON NINO1+2 ANOM ... NINO3.4 ANOM)
-    direct_loss_aggregated_output_*.csv  SHELDUS county x year x month losses (optional;
-                        a file named SHELDUS.csv also works)
+    1950-2025_SPC.csv                    SPC "actual tornadoes" CSV
+    ERA5_core_monthly.nc                 ERA5 monthly means: cape, d2m, t2m
+    ERA5_Volumetric_soil_layer_1.nc      (with --extra soil)
+    ERA5_total_precipitation.nc          (with --extra precip)
+    ERDDAP.csv                           ERSST v5 'ssta' for the Gulf box
+    NOAA_SST.txt                         monthly Nino indices
+    direct_loss_aggregated_output_*.csv  SHELDUS county x year x month losses
+    era5_pressure_winds.csv, era5_surface.csv   from combine_hourly.py (with --hourly)
 
-Run (PowerShell, one line):
-    python pcmci_pipeline.py --outcome spc
-    python pcmci_pipeline.py --outcome sheldus
-    python pcmci_pipeline.py --outcome both --tau-max 6
+Run (one line in PowerShell):
+    python preprocess_data.py --outcome both --era5-file ERA5_core_monthly.nc --extra soil precip --hourly --box 43 26 -106 -94
 
-Outputs go to ./output
+Writes to ./output:
+    merged_monthly_<outcome>.csv     raw monthly values (before anomalies)
+    preprocessed_<outcome>.csv       standardized anomalies: this is what PCMCI reads
+    preprocessed_<outcome>.meta.json states / box / dates, used for graph captions
+    qa_series_<outcome>.png          quick look at every series
 """
 import argparse
+import json
 import os
 import sys
 
@@ -102,12 +112,44 @@ def load_era5(path, start, end, box=None):
     variables = ["cape", "d2m", "t2m"]
     sub = ds[variables].sel({tdim: slice(start, end), "latitude": lat_sl,
                              "longitude": slice(box["west"], box["east"])})
-    weights = np.cos(np.deg2rad(sub["latitude"]))
+    weights = sub["latitude"].copy(data=np.cos(np.deg2rad(sub["latitude"].values)))
     mean = sub.weighted(weights).mean(dim=["latitude", "longitude"])
     df = mean.to_dataframe()[variables]
     df.index = pd.DatetimeIndex(df.index).to_period("M").to_timestamp()
     df = df.rename(columns={"cape": "cape", "d2m": "dewpoint", "t2m": "t2m"})
     return df.reindex(month_index(start, end))
+
+
+# optional extra ERA5 monthly variables: key -> (file, candidate variable names, column name)
+EXTRA_ERA5 = {
+    "soil": ("ERA5_Volumetric_soil_layer_1.nc", ("swvl1",), "soil_moisture"),
+    "precip": ("ERA5_total_precipitation.nc", ("tp",), "precip"),
+}
+
+
+def load_era5_monthly(path, start, end, box, candidates, name):
+    """Area-weighted regional monthly mean of ONE variable from an ERA5 monthly file."""
+    import xarray as xr
+    ds = xr.open_dataset(path)
+    var = next((v for v in candidates if v in ds.data_vars), None)
+    if var is None:
+        if len(ds.data_vars) == 1:
+            var = list(ds.data_vars)[0]
+        else:
+            sys.exit(f"{path}: expected one of {candidates}, found {list(ds.data_vars)}")
+    tdim = "valid_time" if "valid_time" in ds.dims else "time"
+    lat_desc = bool(ds["latitude"][0] > ds["latitude"][-1])
+    lat_sl = (slice(box["north"], box["south"]) if lat_desc
+              else slice(box["south"], box["north"]))
+    sub = ds[var].sel({tdim: slice(start, end), "latitude": lat_sl,
+                       "longitude": slice(box["west"], box["east"])})
+    if sub.size == 0:
+        sys.exit(f"{path}: no data inside the box {box}. Check the area used when "
+                 f"downloading (North, West, South, East = 43, -107, 25, -84).")
+    weights = sub["latitude"].copy(data=np.cos(np.deg2rad(sub["latitude"].values)))
+    s = sub.weighted(weights).mean(dim=["latitude", "longitude"]).to_series()
+    s.index = pd.DatetimeIndex(s.index).to_period("M").to_timestamp()
+    return s.reindex(month_index(start, end)).rename(name)
 
 
 def load_sheldus(path, states, start, end):
@@ -155,9 +197,59 @@ def find_sheldus(data_dir, explicit=None):
     return hits[0]
 
 
+
+# --------------------------------------------------------------------------
+# Hourly ERA5 (the two CSVs from combine_hourly.py) -> monthly columns
+# --------------------------------------------------------------------------
+HOURLY_VARS = ["shear", "cape_hourly", "cape_x_shear", "favorable_days"]
+
+
+def check_box(path, box):
+    """Warn if a combine_hourly.py CSV was made for a different box than this run."""
+    meta = os.path.splitext(path)[0] + ".meta.json"
+    if not os.path.exists(meta):
+        return
+    saved = json.load(open(meta)).get("box_NSWE")
+    mine = [box["north"], box["south"], box["west"], box["east"]]
+    if saved and any(abs(x - y) > 1e-6 for x, y in zip(saved, mine)):
+        print(f"WARNING: {os.path.basename(path)} was built for box (N,S,W,E) {saved} "
+              f"but this run uses {mine}. Re-run combine_hourly.py with the same --box.")
+
+
+def hourly_monthly(wind_csv, surface_csv, cols, start, end, box, cape_thr, shear_thr):
+    """Derive shear etc. from the raw regional-mean CSVs, then take monthly values.
+
+    shear           = |wind(500 hPa) - wind(10 m)| in m/s (proxy for deep-layer shear)
+    cape_hourly     = CAPE at the downloaded hours
+    cape_x_shear    = CAPE * shear
+    favorable_days  = days on which regional-mean CAPE >= cape_thr AND shear >= shear_thr
+                      (log1p applied, like the other counts)
+    """
+    for p in (wind_csv, surface_csv):
+        if not os.path.exists(p):
+            sys.exit(f"{p} not found. Run combine_hourly.py first.")
+        check_box(p, box)
+    w = pd.read_csv(wind_csv, parse_dates=["time"], index_col="time")
+    s = pd.read_csv(surface_csv, parse_dates=["time"], index_col="time")
+    h = w.join(s, how="inner")
+    h["shear"] = np.hypot(h["u500"] - h["u10"], h["v500"] - h["v10"])
+    h["cape_hourly"] = h["cape"]
+    h["cape_x_shear"] = h["cape"] * h["shear"]
+    fav = (h["cape"] >= cape_thr) & (h["shear"] >= shear_thr)
+    times = pd.DatetimeIndex(h.index)
+    daily_fav = fav.groupby(times.normalize()).any()
+    month = times.to_period("M")
+    monthly = h[["shear", "cape_hourly", "cape_x_shear"]].groupby(month).mean()
+    monthly["favorable_days"] = (daily_fav.groupby(pd.DatetimeIndex(daily_fav.index).to_period("M"))
+                                 .sum().astype(float).apply(np.log1p))
+    monthly.index = pd.PeriodIndex(monthly.index).to_timestamp()
+    return monthly[cols].reindex(month_index(start, end))
+
+
 # --------------------------------------------------------------------------
 # Preprocessing
 # --------------------------------------------------------------------------
+
 def to_anomalies(df):
     """Per-calendar-month standardized anomalies, then remove a linear trend."""
     out = df.copy().astype(float)
@@ -186,128 +278,6 @@ def stationarity_report(df):
         print(f"  {c:14s} p = {adfuller(df[c].dropna())[1]:.4f}")
 
 
-# --------------------------------------------------------------------------
-# PCMCI+
-# --------------------------------------------------------------------------
-def run_pcmciplus(df, tau_max, alpha):
-    try:
-        from tigramite import data_processing as pp
-        from tigramite.pcmci import PCMCI
-        from tigramite.independence_tests.parcorr import ParCorr
-    except ImportError:
-        sys.exit("tigramite is not installed. Run: python -m pip install tigramite joblib")
-    dataframe = pp.DataFrame(df.to_numpy(dtype=float), var_names=list(df.columns))
-    pcmci = PCMCI(dataframe=dataframe, cond_ind_test=ParCorr(significance="analytic"),
-                  verbosity=0)
-    # PCMCI+ uses a single significance level (pc_alpha) for all of its tests.
-    return pcmci.run_pcmciplus(tau_min=0, tau_max=tau_max, pc_alpha=alpha)
-
-
-def extract_links(res, names, tau_max):
-    g, v, p = res["graph"], res["val_matrix"], res["p_matrix"]
-    n = len(names)
-    rows = []
-    for j in range(n):
-        for i in range(n):
-            for tau in range(tau_max + 1):
-                s = g[i, j, tau]
-                if s == "":
-                    continue
-                if tau == 0:
-                    if i == j or s == "<--":  # '<--' is reported from the other side
-                        continue
-                    if s in ("o-o", "x-x", "x-o", "o-x") and i > j:
-                        continue
-                rows.append(dict(source=names[i], target=names[j], lag=tau, mark=s,
-                                 strength=float(v[i, j, tau]), p_value=float(p[i, j, tau])))
-    return pd.DataFrame(rows)
-
-
-# Node labels shown in the graph (abbreviations spelled out; "\n" = line break)
-DISPLAY_NAMES = {
-    "enso": "El Niño–Southern\nOscillation (ENSO)",
-    "gulf_sst": "Gulf of Mexico\nSea Surface Temp.",
-    "cape": "Convective Available\nPotential Energy (CAPE)",
-    "dewpoint": "2 m Dewpoint\nTemperature",
-    "t2m": "2 m Air\nTemperature",
-    "tornado_days": "Tornado Days\n(EF1+ per month)",
-    "sheldus_loss": "Tornado Losses\n(SHELDUS)",
-}
-# Detail text for the legend under the graph
-VAR_DETAILS = {
-    "enso": "Niño 3.4 sea-surface-temperature anomaly, tropical Pacific",
-    "gulf_sst": "ERSST v5 anomaly, averaged over the Gulf of Mexico box",
-    "cape": "ERA5 regional monthly mean; storm instability",
-    "dewpoint": "ERA5 regional monthly mean; near-surface moisture",
-    "t2m": "ERA5 regional monthly mean",
-    "tornado_days": "log(1 + days per month with an EF1+ tornado), {states}, SPC",
-    "sheldus_loss": "log(1 + inflation-adjusted property+crop losses), {states}, SHELDUS",
-}
-HOW_TO_READ = [
-    "Arrowhead  =  directed link (cause -> effect)",
-    "Circle on an end  =  direction not determined",
-    "Number on an arrow  =  lag in months",
-    "No number  =  same-month link",
-    "Red = positive, blue = negative relationship;",
-    "   paler / thinner = weaker",
-    "Node color (left bar) = how strongly the",
-    "   variable persists from month to month",
-    "Link color (right bar) = link strength",
-]
-
-
-def draw_graph_png(res, labels, raw_path):
-    """Render tigramite's graph to a PNG without clipping the colorbar labels."""
-    import matplotlib.pyplot as plt
-    from tigramite import plotting as tp
-    kw = dict(graph=res["graph"], val_matrix=res["val_matrix"], var_names=labels)
-    try:
-        # draw on our own figure so we can save with bbox_inches="tight"
-        fig = plt.figure(figsize=(11, 9))
-        ax = fig.add_subplot(111, frame_on=False)
-        tp.plot_graph(fig_ax=(fig, ax), link_colorbar_label="Link strength (MCI)",
-                      node_colorbar_label="Persistence (auto-MCI)", **kw)
-        fig.savefig(raw_path, dpi=200, bbox_inches="tight")
-        plt.close(fig)
-    except TypeError:  # older tigramite without these options
-        plt.close("all")
-        tp.plot_graph(save_name=raw_path, **kw)
-
-
-def save_graph(res, names, path, states):
-    """Save the graph with spelled-out node names plus a legend panel underneath."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        raw = path.replace(".png", "_raw.png")
-        labels = [DISPLAY_NAMES.get(n, n) for n in names]
-        draw_graph_png(res, labels, raw)
-        plt.close("all")
-        img = plt.imread(raw)
-        fig = plt.figure(figsize=(11, 12))
-        gs = fig.add_gridspec(2, 1, height_ratios=[3, 1.25])
-        ax = fig.add_subplot(gs[0])
-        ax.imshow(img)
-        ax.axis("off")
-        lax = fig.add_subplot(gs[1])
-        lax.axis("off")
-        lax.text(0.0, 1.0, "Variables", fontsize=11, fontweight="bold", va="top")
-        st = "/".join(states)
-        lines = [DISPLAY_NAMES.get(n, n).replace("\n", " ") + ": "
-                 + VAR_DETAILS.get(n, "").format(states=st) for n in names]
-        lax.text(0.0, 0.88, "\n\n".join(lines), fontsize=7.5, va="top", linespacing=1.1)
-        lax.text(0.66, 1.0, "How to read the graph", fontsize=11, fontweight="bold",
-                 va="top")
-        lax.text(0.66, 0.88, "\n".join(HOW_TO_READ), fontsize=8.5, va="top",
-                 linespacing=1.5)
-        fig.savefig(path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        os.remove(raw)
-    except Exception as e:  # plotting should never kill a finished run
-        print(f"(could not save graph image: {e})")
-
-
 def save_qa_plot(df, path):
     import matplotlib
     matplotlib.use("Agg")
@@ -334,43 +304,54 @@ def main():
                     help="path to the SHELDUS direct-loss CSV (auto-detected by default)")
     ap.add_argument("--outcome", choices=["spc", "sheldus", "both"], default="spc")
     ap.add_argument("--states", nargs="+", default=STATES)
-    # ENSO file starts in 1982, so that is the first common month
-    ap.add_argument("--box", nargs=4, type=float, metavar=("N", "S", "W", "E"),
-                    default=None,
-                    help="ERA5 averaging box: north south west east (degrees, west negative). "
+    ap.add_argument("--box", nargs=4, type=float, metavar=("N", "S", "W", "E"), default=None,
+                    help="ERA5 averaging box: north south west east (west negative). "
                          "Should cover the same area as --states.")
-    ap.add_argument("--start", default="1982-01")
+    ap.add_argument("--start", default="1982-01")   # the ENSO file starts in 1982
     ap.add_argument("--end", default="2024-12")
-    ap.add_argument("--tau-max", type=int, default=3)
-    ap.add_argument("--alpha", type=float, default=0.01)
-    ap.add_argument("--drop", nargs="*", default=[],
-                    help="predictor columns to leave out, e.g. --drop t2m")
+    ap.add_argument("--era5-file", default="ERA5_core_monthly.nc",
+                    help="monthly ERA5 file with cape/d2m/t2m (inside --data-dir)")
+    ap.add_argument("--extra", nargs="*", choices=sorted(EXTRA_ERA5), default=[],
+                    help="extra monthly ERA5 variables: soil precip")
+    ap.add_argument("--hourly", action="store_true",
+                    help="add columns derived from the hourly CSVs (combine_hourly.py)")
+    ap.add_argument("--hourly-vars", nargs="*", choices=HOURLY_VARS,
+                    default=["shear", "favorable_days"])
+    ap.add_argument("--cape-thr", type=float, default=500.0, help="J/kg, for favorable_days")
+    ap.add_argument("--shear-thr", type=float, default=15.0, help="m/s, for favorable_days")
     a = ap.parse_args()
 
     os.makedirs(a.out_dir, exist_ok=True)
     d = lambda f: os.path.join(a.data_dir, f)
-
     box = dict(zip(("north", "south", "west", "east"), a.box)) if a.box else BOX
     print(f"States: {', '.join(a.states)} | ERA5 box (N,S,W,E): "
           f"{box['north']}, {box['south']}, {box['west']}, {box['east']}")
+
     print("Loading predictors...")
-    predictors = pd.concat([
+    pieces = [
         load_enso(d("NOAA_SST.txt"), a.start, a.end),
         load_gulf_sst(d("ERDDAP.csv"), a.start, a.end),
-        load_era5(d("ERA5.nc"), a.start, a.end, box),
-    ], axis=1).drop(columns=a.drop, errors="ignore")
+        load_era5(d(a.era5_file), a.start, a.end, box),
+    ]
+    for key in a.extra:
+        fname, cands, col = EXTRA_ERA5[key]
+        pieces.append(load_era5_monthly(d(fname), a.start, a.end, box, cands, col))
+    if a.hourly:
+        pieces.append(hourly_monthly(d("era5_pressure_winds.csv"), d("era5_surface.csv"),
+                                     a.hourly_vars, a.start, a.end, box,
+                                     a.cape_thr, a.shear_thr))
+    predictors = pd.concat(pieces, axis=1)
 
     outcomes = {}
     if a.outcome in ("spc", "both"):
-        outcomes["tornado_days"] = load_spc(d("1950-2025_SPC.csv"), a.states,
-                                            a.start, a.end)
+        outcomes["tornado_days"] = load_spc(d("1950-2025_SPC.csv"), a.states, a.start, a.end)
     if a.outcome in ("sheldus", "both"):
-        outcomes["sheldus_loss"] = load_sheldus(find_sheldus(a.data_dir, a.sheldus_file), a.states,
-                                                a.start, a.end)
+        outcomes["sheldus_loss"] = load_sheldus(find_sheldus(a.data_dir, a.sheldus_file),
+                                                a.states, a.start, a.end)
 
     for name, series in outcomes.items():
         df = pd.concat([predictors, series], axis=1)
-        print(f"\n=== Run: outcome = {name} ===")
+        print(f"\n=== Outcome: {name} ===")
         print("Non-missing months per variable:")
         print(df.notna().sum().to_string())
         n0 = len(df)
@@ -383,24 +364,16 @@ def main():
         save_qa_plot(df, os.path.join(a.out_dir, f"qa_series_{name}.png"))
 
         an = to_anomalies(df).dropna()
+        an.index.name = "date"
         an.to_csv(os.path.join(a.out_dir, f"preprocessed_{name}.csv"))
+        with open(os.path.join(a.out_dir, f"preprocessed_{name}.meta.json"), "w") as f:
+            json.dump({"states": a.states,
+                       "box_NSWE": [box["north"], box["south"], box["west"], box["east"]],
+                       "start": a.start, "end": a.end}, f)
         stationarity_report(an)
+        print(f"Wrote preprocessed_{name}.csv ({len(an)} months x {an.shape[1]} variables)")
 
-        print(f"\nRunning PCMCI+ on {len(an)} months x {an.shape[1]} variables "
-              f"(tau_max={a.tau_max}, alpha={a.alpha})")
-        res = run_pcmciplus(an, a.tau_max, a.alpha)
-        links = extract_links(res, list(an.columns), a.tau_max)
-        if links.empty:
-            print("No significant links.")
-        else:
-            links = links.sort_values(["target", "lag", "source"]).reset_index(drop=True)
-            print(links.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
-            links.to_csv(os.path.join(a.out_dir, f"links_{name}.csv"), index=False)
-        save_graph(res, list(an.columns), os.path.join(a.out_dir, f"graph_{name}.png"),
-                   a.states)
-        print("(mark '-->' = directed; 'o-o' = same-month link whose direction is undetermined)")
-
-    print(f"\nDone. Results in ./{a.out_dir}")
+    print(f"\nDone. Next: python pcmci.py --outcome {a.outcome}")
 
 
 if __name__ == "__main__":
