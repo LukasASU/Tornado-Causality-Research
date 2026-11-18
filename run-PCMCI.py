@@ -86,7 +86,7 @@ VAR_DETAILS = {
     "dewpoint": "ERA5 regional monthly mean; near-surface moisture",
     "t2m": "ERA5 regional monthly mean",
     "soil_moisture": "ERA5 volumetric soil water, layer 1, regional monthly mean",
-    "shear": "wind speed difference, 500 hPa minus 10 m (m/s), from regional-mean ERA5 winds",
+    "shear": "wind speed difference, 500 hPa minus 10 m (m/s), regional mean",
     "cape_hourly": "ERA5 CAPE at the downloaded hours, regional mean",
     "cape_x_shear": "regional-mean CAPE times shear",
     "favorable_days": "log(1 + days per month with regional CAPE and shear both above thresholds)",
@@ -104,14 +104,31 @@ HOW_TO_READ = [
     "Node color (left bar) = how strongly the",
     "   variable persists from month to month",
     "Link color (right bar) = link strength",
+    "Orange glow + bold name = the outcome variable",
 ]
+OUTCOMES = ("tornado_days", "sheldus_loss")
 
 
 def label_of(name):
     return DISPLAY_NAMES[name] if name in DISPLAY_NAMES else name
 
 
-def draw_graph_png(res, labels, raw_path):
+def highlight_outcomes(ax, outcome_labels):
+    """Add a soft orange glow behind the outcome node(s) and make their names bold.
+    Finds each node by its label text, so it does not depend on tigramite internals;
+    if a label is not found, that node is simply left unhighlighted."""
+    xlim, ylim = ax.get_xlim(), ax.get_ylim()
+    for t in ax.texts:
+        if t.get_text() in outcome_labels:
+            x, y = t.get_position()
+            ax.scatter([x], [y], s=16000, color="#f59e0b", alpha=0.35, zorder=0,
+                       linewidths=0)
+            t.set_fontweight("bold")
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+
+
+def draw_graph_png(res, labels, raw_path, outcome_labels=()):
     """Render tigramite's graph to a PNG without clipping the colorbar labels."""
     import matplotlib.pyplot as plt
     from tigramite import plotting as tp
@@ -122,6 +139,10 @@ def draw_graph_png(res, labels, raw_path):
         ax = fig.add_subplot(111, frame_on=False)
         tp.plot_graph(fig_ax=(fig, ax), link_colorbar_label="Link strength (MCI)",
                       node_colorbar_label="Persistence (auto-MCI)", **kw)
+        try:
+            highlight_outcomes(ax, set(outcome_labels))
+        except Exception as e:   # the highlight is cosmetic; never lose the graph
+            print(f"(could not highlight outcome: {e})")
         fig.savefig(raw_path, dpi=200, bbox_inches="tight")
         plt.close(fig)
     except TypeError:  # older tigramite without these options
@@ -137,7 +158,8 @@ def save_graph(res, names, path, states):
         import matplotlib.pyplot as plt
         raw = path.replace(".png", "_raw.png")
         labels = [label_of(n) for n in names]
-        draw_graph_png(res, labels, raw)
+        outcome_labels = [label_of(n) for n in names if n in OUTCOMES]
+        draw_graph_png(res, labels, raw, outcome_labels)
         plt.close("all")
         img = plt.imread(raw)
         fig = plt.figure(figsize=(11, 12))
@@ -161,7 +183,6 @@ def save_graph(res, names, path, states):
         os.remove(raw)
     except Exception as e:  # plotting should never kill a finished run
         print(f"(could not save graph image: {e})")
-
 
 
 # --------------------------------------------------------------------------
