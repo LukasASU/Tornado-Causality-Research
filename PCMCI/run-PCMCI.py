@@ -102,7 +102,8 @@ VAR_DETAILS = {
 }
 HOW_TO_READ = [
     "Arrowhead  =  directed link (cause -> effect)",
-    "Circle on an end  =  direction not determined",
+    "Circle (o) on an end  =  direction not determined",
+    "x on an end  =  conflicting evidence about direction",
     "Number on an arrow  =  lag in months",
     "No number  =  same-month link",
     "Red = positive, blue = negative relationship;",
@@ -275,7 +276,8 @@ def main():
             links.to_csv(os.path.join(a.out_dir, f"links_{name}.csv"), index=False)
         save_graph(res, list(df.columns), os.path.join(a.out_dir, f"graph_{name}.png"),
                    states)
-        print("(mark '-->' = directed; 'o-o' = same-month link whose direction is undetermined)")
+        print("(mark '-->' = directed; 'o-o' = same-month link whose direction is undetermined; "
+              "'x' on an end = conflicting evidence about the direction)")
 
     print(f"\nDone. Results in ./{a.out_dir}")
 
