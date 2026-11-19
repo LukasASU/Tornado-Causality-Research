@@ -18,7 +18,7 @@ Expected files in ./Data :
     era5_pressure_winds.csv, era5_surface.csv   from combine_hourly.py (with --hourly)
 
 Run (one line in PowerShell):
-    python preprocess_data.py --outcome both --era5-file ERA5_core_monthly.nc --extra soil precip --hourly --box 43 26 -106 -94
+    python preprocess_data.py --outcome all --era5-file ERA5_core_monthly.nc --extra soil precip --hourly --box 43 26 -106 -94
 
 Writes to ./output:
     merged_monthly_<outcome>.csv     raw monthly values (before anomalies)
@@ -65,17 +65,46 @@ def month_index(start, end):
     return pd.date_range(start, end, freq="MS")
 
 
-def load_spc(path, states, start, end, min_mag=1):
-    """log(1 + number of days per month with an EF>=min_mag tornado in `states`)."""
-    df = pd.read_csv(path, usecols=["yr", "mo", "dy", "st", "mag"])
+def _spc_events(path, states, min_mag):
+    """EF>=min_mag tornado records in `states`, with a date column."""
+    cols = ["yr", "mo", "dy", "st", "mag"]
+    has_sg = "sg" in pd.read_csv(path, nrows=0).columns
+    df = pd.read_csv(path, usecols=cols + (["sg"] if has_sg else []))
     df = df[df["st"].isin(states) & (df["mag"] >= min_mag)].copy()
+    if has_sg:                       # sg = -9 rows only repeat part of a multi-state track
+        df = df[df["sg"] != -9]
     df["date"] = pd.to_datetime(pd.DataFrame({"year": df["yr"], "month": df["mo"],
                                               "day": df["dy"]}))
-    days = df.drop_duplicates("date")
-    s = days.groupby(days["date"].dt.to_period("M")).size()
+    return df
+
+
+def _monthly_count(dates, start, end, name):
+    """log(1 + how many of `dates` fall in each month); months with none are 0."""
+    s = pd.Series(1.0, index=pd.DatetimeIndex(dates)).groupby(
+        pd.DatetimeIndex(dates).to_period("M")).sum()
     s.index = pd.PeriodIndex(s.index).to_timestamp()
-    s = s.reindex(month_index(start, end), fill_value=0).astype(float)
-    return s.apply(np.log1p).rename("tornado_days")
+    s = s.reindex(month_index(start, end), fill_value=0.0)
+    return s.apply(np.log1p).rename(name)
+
+
+def load_spc(path, states, start, end, min_mag=1):
+    """log(1 + number of days per month with an EF>=min_mag tornado in `states`)."""
+    df = _spc_events(path, states, min_mag)
+    return _monthly_count(df["date"].drop_duplicates(), start, end, "tornado_days")
+
+
+def load_spc_count(path, states, start, end, min_mag=1):
+    """log(1 + number of EF>=min_mag tornadoes per month): keeps the size of outbreaks."""
+    df = _spc_events(path, states, min_mag)
+    return _monthly_count(df["date"], start, end, "tornado_count")
+
+
+def load_spc_outbreaks(path, states, start, end, min_mag=1, outbreak_min=6):
+    """log(1 + number of days per month with at least `outbreak_min` EF>=min_mag tornadoes)."""
+    df = _spc_events(path, states, min_mag)
+    per_day = df.groupby("date").size()
+    return _monthly_count(per_day[per_day >= outbreak_min].index, start, end,
+                          "outbreak_days")
 
 
 def load_enso(path, start, end):
@@ -302,7 +331,12 @@ def main():
     ap.add_argument("--out-dir", default="output")
     ap.add_argument("--sheldus-file", default=None,
                     help="path to the SHELDUS direct-loss CSV (auto-detected by default)")
-    ap.add_argument("--outcome", choices=["spc", "sheldus", "both"], default="spc")
+    ap.add_argument("--outcome", choices=["spc", "count", "outbreaks", "sheldus", "both", "all"],
+                    default="spc",
+                    help="spc = tornado days, count = tornado count, outbreaks = outbreak "
+                         "days, sheldus = losses, both = spc + sheldus, all = every outcome")
+    ap.add_argument("--outbreak-min", type=int, default=6,
+                    help="tornadoes per day that make an outbreak day (default 6)")
     ap.add_argument("--states", nargs="+", default=STATES)
     ap.add_argument("--box", nargs=4, type=float, metavar=("N", "S", "W", "E"), default=None,
                     help="ERA5 averaging box: north south west east (west negative). "
@@ -342,10 +376,19 @@ def main():
                                      a.cape_thr, a.shear_thr))
     predictors = pd.concat(pieces, axis=1)
 
+    wanted = {"spc": ["spc"], "count": ["count"], "outbreaks": ["outbreaks"],
+              "sheldus": ["sheldus"], "both": ["spc", "sheldus"],
+              "all": ["spc", "count", "outbreaks", "sheldus"]}[a.outcome]
     outcomes = {}
-    if a.outcome in ("spc", "both"):
-        outcomes["tornado_days"] = load_spc(d("1950-2025_SPC.csv"), a.states, a.start, a.end)
-    if a.outcome in ("sheldus", "both"):
+    spc_file = d("1950-2025_SPC.csv")
+    if "spc" in wanted:
+        outcomes["tornado_days"] = load_spc(spc_file, a.states, a.start, a.end)
+    if "count" in wanted:
+        outcomes["tornado_count"] = load_spc_count(spc_file, a.states, a.start, a.end)
+    if "outbreaks" in wanted:
+        outcomes["outbreak_days"] = load_spc_outbreaks(spc_file, a.states, a.start, a.end,
+                                                       outbreak_min=a.outbreak_min)
+    if "sheldus" in wanted:
         outcomes["sheldus_loss"] = load_sheldus(find_sheldus(a.data_dir, a.sheldus_file),
                                                 a.states, a.start, a.end)
 

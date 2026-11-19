@@ -9,6 +9,7 @@ monthly anomalies, one column per variable).
 Run:
     python pcmci.py --outcome spc
     python pcmci.py --outcome both --tau-max 6
+    python pcmci.py --outcome all                 # spc, count, outbreaks, sheldus
     python pcmci.py --outcome both --drop t2m favorable_days     # leave variables out
 
 Writes to ./output:
@@ -19,6 +20,7 @@ import argparse
 import json
 import os
 import sys
+from typing import Any, Dict
 
 import numpy as np
 import pandas as pd
@@ -76,6 +78,8 @@ DISPLAY_NAMES = {
     "favorable_days": "Favorable Storm\nDays per Month",
     "precip": "Total\nPrecipitation",
     "tornado_days": "Tornado Days\n(EF1+ per month)",
+    "tornado_count": "Tornado Count\n(EF1+ per month)",
+    "outbreak_days": "Outbreak Days\n(per month)",
     "sheldus_loss": "Tornado Losses\n(SHELDUS)",
 }
 # Detail text for the legend under the graph
@@ -92,6 +96,8 @@ VAR_DETAILS = {
     "favorable_days": "log(1 + days per month with regional CAPE and shear both above thresholds)",
     "precip": "ERA5 total precipitation, regional monthly mean",
     "tornado_days": "log(1 + days per month with an EF1+ tornado), {states}, SPC",
+    "tornado_count": "log(1 + number of EF1+ tornadoes per month), {states}, SPC",
+    "outbreak_days": "log(1 + days per month with 6 or more EF1+ tornadoes), {states}, SPC",
     "sheldus_loss": "log(1 + inflation-adjusted property+crop losses), {states}, SHELDUS",
 }
 HOW_TO_READ = [
@@ -105,12 +111,29 @@ HOW_TO_READ = [
     "   variable persists from month to month",
     "Link color (right bar) = link strength",
     "Orange glow + bold name = the outcome variable",
+    "[Text in brackets] = where the data comes from",
 ]
-OUTCOMES = ("tornado_days", "sheldus_loss")
+OUTCOMES = ("tornado_days", "tornado_count", "outbreak_days", "sheldus_loss")
+
+
+# Where each variable comes from, shown as a last line in the node label
+SOURCES = {
+    "enso": "NOAA", "gulf_sst": "ERSST v5",
+    "cape": "ERA5", "dewpoint": "ERA5", "t2m": "ERA5", "soil_moisture": "ERA5",
+    "precip": "ERA5", "shear": "ERA5 hourly", "cape_hourly": "ERA5 hourly",
+    "cape_x_shear": "ERA5 hourly", "favorable_days": "ERA5 hourly",
+    "tornado_days": "SPC", "tornado_count": "SPC", "outbreak_days": "SPC",
+    "sheldus_loss": "SHELDUS",
+}
+
+
+def base_label(name):
+    return DISPLAY_NAMES[name] if name in DISPLAY_NAMES else name
 
 
 def label_of(name):
-    return DISPLAY_NAMES[name] if name in DISPLAY_NAMES else name
+    """Node label: display name plus a final line with the data source."""
+    return base_label(name) + (f"\n[{SOURCES[name]}]" if name in SOURCES else "")
 
 
 def highlight_outcomes(ax, outcome_labels):
@@ -128,14 +151,33 @@ def highlight_outcomes(ax, outcome_labels):
     ax.set_ylim(ylim)
 
 
+# Smaller nodes leave more space between them. 1.0 = tigramite's default size;
+# lower it (e.g. 0.5) for more space, raise it if the labels no longer fit in the nodes.
+NODE_SIZE_SCALE = 0.7
+FIGURE_SIZE = (14, 11)     # bigger figure = more room for the graph
+
+
+def spacing_kwargs(plot_graph) -> Dict[str, Any]:
+    """Shrink tigramite's node size (if this version has the option) to space nodes out."""
+    import inspect
+    try:
+        default = inspect.signature(plot_graph).parameters["node_size"].default
+    except (KeyError, TypeError, ValueError):
+        return {}
+    if isinstance(default, (int, float)) and default > 0:
+        return {"node_size": default * NODE_SIZE_SCALE}
+    return {}
+
+
 def draw_graph_png(res, labels, raw_path, outcome_labels=()):
     """Render tigramite's graph to a PNG without clipping the colorbar labels."""
     import matplotlib.pyplot as plt
     from tigramite import plotting as tp
-    kw = dict(graph=res["graph"], val_matrix=res["val_matrix"], var_names=labels)
+    kw: Dict[str, Any] = dict(graph=res["graph"], val_matrix=res["val_matrix"],
+                              var_names=labels, **spacing_kwargs(tp.plot_graph))
     try:
         # draw on our own figure so we can save with bbox_inches="tight"
-        fig = plt.figure(figsize=(11, 9))
+        fig = plt.figure(figsize=FIGURE_SIZE)
         ax = fig.add_subplot(111, frame_on=False)
         tp.plot_graph(fig_ax=(fig, ax), link_colorbar_label="Link strength (MCI)",
                       node_colorbar_label="Persistence (auto-MCI)", **kw)
@@ -171,7 +213,7 @@ def save_graph(res, names, path, states):
         lax.axis("off")
         lax.text(0.0, 1.0, "Variables", fontsize=11, fontweight="bold", va="top")
         st = "/".join(states)
-        lines = [label_of(n).replace("\n", " ") + ": "
+        lines = [base_label(n).replace("\n", " ") + ": "
                  + VAR_DETAILS.get(n, "").format(states=st) for n in names]
         lax.text(0.0, 0.88, "\n\n".join(lines), fontsize=7.5, va="top", linespacing=1.1)
         lax.text(0.66, 1.0, "How to read the graph", fontsize=11, fontweight="bold",
@@ -188,7 +230,9 @@ def save_graph(res, names, path, states):
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
-OUTCOME_COLUMN = {"spc": "tornado_days", "sheldus": "sheldus_loss"}
+OUTCOME_COLUMN = {"spc": "tornado_days", "count": "tornado_count",
+                  "outbreaks": "outbreak_days", "sheldus": "sheldus_loss"}
+OUTCOME_GROUPS = {"both": ["spc", "sheldus"], "all": list(OUTCOME_COLUMN)}
 
 
 def main():
@@ -197,7 +241,8 @@ def main():
     ap.add_argument("--in-dir", default="output",
                     help="where preprocess_data.py wrote its files")
     ap.add_argument("--out-dir", default="output")
-    ap.add_argument("--outcome", choices=["spc", "sheldus", "both"], default="spc")
+    ap.add_argument("--outcome", choices=list(OUTCOME_COLUMN) + list(OUTCOME_GROUPS),
+                    default="spc")
     ap.add_argument("--tau-max", type=int, default=3, help="longest lag to test, in months")
     ap.add_argument("--alpha", type=float, default=0.01, help="significance level")
     ap.add_argument("--drop", nargs="*", default=[],
@@ -205,7 +250,7 @@ def main():
     a = ap.parse_args()
 
     os.makedirs(a.out_dir, exist_ok=True)
-    kinds = ["spc", "sheldus"] if a.outcome == "both" else [a.outcome]
+    kinds = OUTCOME_GROUPS.get(a.outcome, [a.outcome])
     for kind in kinds:
         name = OUTCOME_COLUMN[kind]
         path = os.path.join(a.in_dir, f"preprocessed_{name}.csv")
