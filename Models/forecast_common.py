@@ -31,7 +31,9 @@ What a script does
        1 = perfect, 0 = no better than the average, negative = worse than the average
    with 95% confidence ranges from a moving-block bootstrap (blocks of consecutive months),
    for all months and for the tornado season (March-June) alone.
-5. Writes tables and a chart to ./results (next to these scripts).
+5. Writes tables and two charts to ./results/<outcome>/regression/ (next to these scripts):
+       figures/skill_summary.png         skill of every model with 95% ranges
+       figures/observed_vs_predicted.png observed vs forecast, one panel per model
 
 Important caveat: by default the parents come from links_<outcome>.csv, which PCMCI found
 using ALL years, including the years used for testing. That is mildly optimistic for the
@@ -46,6 +48,8 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+
+import plots
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_PCMCI_DIR = HERE.parent / "PCMCI"          # sibling folder of this one
@@ -139,7 +143,7 @@ def ridge_fit_predict(Xtr: np.ndarray, ytr: np.ndarray, Xte: np.ndarray) -> np.n
 
 def forest_fit_predict(Xtr: np.ndarray, ytr: np.ndarray, Xte: np.ndarray,
                        seed: int) -> np.ndarray:
-    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.ensemble import RandomForestRegressor  # pip install scikit-learn
     if Xtr.shape[1] == 0:
         return np.full(len(Xte), float(ytr.mean()))
     m = RandomForestRegressor(n_estimators=300, min_samples_leaf=10, max_features=0.5,
@@ -186,7 +190,8 @@ def model_list(outcome: str, parents: List[Spec], same: List[str], predictors: L
 # Scoring
 # --------------------------------------------------------------------------
 def score_table(y: np.ndarray, preds: Dict[str, np.ndarray], mask: np.ndarray,
-                groups: Dict[str, str], block: int, n_boot: int, seed: int) -> pd.DataFrame:
+                groups: Dict[str, str], block: int, n_boot: int, seed: int,
+                clim_name: str = CLIM) -> pd.DataFrame:
     """Skill vs climatology with moving-block-bootstrap 95% ranges, plus RMSE, correlation,
     and the skill difference to the all-features model."""
     sel = np.where(mask)[0]
@@ -196,7 +201,7 @@ def score_table(y: np.ndarray, preds: Dict[str, np.ndarray], mask: np.ndarray,
     obs = y[sel]
     names = list(preds)
     sq = {m: (obs - preds[m][sel]) ** 2 for m in names}
-    base = sq[CLIM]
+    base = sq[clim_name]
     rng = np.random.default_rng(seed)
     nblocks = int(np.ceil(n / block))
     starts = rng.integers(0, max(n - block, 0) + 1, size=(n_boot, nblocks))
@@ -210,7 +215,7 @@ def score_table(y: np.ndarray, preds: Dict[str, np.ndarray], mask: np.ndarray,
         skill = 1.0 - sq[m].sum() / base.sum()
         lo, hi = np.percentile(boot[m], [2.5, 97.5])
         p = preds[m][sel]
-        corr = float(np.corrcoef(p, obs)[0, 1]) if (m != CLIM and np.std(p) > 0) else np.nan
+        corr = float(np.corrcoef(p, obs)[0, 1]) if (m != clim_name and np.std(p) > 0) else np.nan
         row = {"model": m, "group": groups[m], "skill": skill, "skill_lo": lo,
                "skill_hi": hi, "rmse": float(np.sqrt(sq[m].mean())), "corr": corr}
         if ref and m != ref:
@@ -221,40 +226,48 @@ def score_table(y: np.ndarray, preds: Dict[str, np.ndarray], mask: np.ndarray,
     return pd.DataFrame(rows)
 
 
-def verdict(table: pd.DataFrame, label: str) -> None:
+def verdict(table: pd.DataFrame, label: str, baseline: str = "climatology") -> None:
     """A few plain-language lines about the comparison that matters."""
     if table.empty:
         return
-    t = table.set_index("model")
+    rows: Dict[str, Dict[str, Any]] = {}
+    for rec in table.to_dict("records"):
+        clean = {str(k): v for k, v in rec.items()}
+        rows[str(clean["model"])] = clean
     print(f"\n  Reading the {label} results:")
     for m in (CAUSAL_OWN, CAUSAL, ALLF, NOWCAST):
-        if m not in t.index:
+        if m not in rows:
             continue
-        r = t.loc[m]
-        if r["skill_lo"] > 0:
-            word = "beats the climatology baseline"
-        elif r["skill_hi"] < 0:
-            word = "is WORSE than the climatology baseline"
+        skill = float(rows[m]["skill"])
+        lo = float(rows[m]["skill_lo"])
+        hi = float(rows[m]["skill_hi"])
+        if lo > 0:
+            word = f"beats the {baseline} baseline"
+        elif hi < 0:
+            word = f"is WORSE than the {baseline} baseline"
         else:
-            word = "cannot be told apart from the climatology baseline"
-        print(f"   - {m}: skill {r['skill']:+.3f} [{r['skill_lo']:+.3f}, "
-              f"{r['skill_hi']:+.3f}] -> {word}")
-    if CAUSAL_OWN in t.index and "diff_lo" in t.columns:
-        r = t.loc[CAUSAL_OWN]
-        if r["diff_lo"] > 0:
+            word = f"cannot be told apart from the {baseline} baseline"
+        print(f"   - {m}: skill {skill:+.3f} [{lo:+.3f}, {hi:+.3f}] -> {word}")
+    if CAUSAL_OWN in rows and "diff_lo" in rows[CAUSAL_OWN]:
+        diff = float(rows[CAUSAL_OWN]["diff_vs_all"])
+        dlo = float(rows[CAUSAL_OWN]["diff_lo"])
+        dhi = float(rows[CAUSAL_OWN]["diff_hi"])
+        if dlo > 0:
             word = "the causal parents forecast BETTER than all features"
-        elif r["diff_hi"] < 0:
+        elif dhi < 0:
             word = "the causal parents forecast WORSE than all features"
         else:
             word = "no clear difference between causal parents and all features"
         print(f"   - Causal parents + own past minus all features: "
-              f"{r['diff_vs_all']:+.3f} [{r['diff_lo']:+.3f}, {r['diff_hi']:+.3f}] -> {word}")
+              f"{diff:+.3f} [{dlo:+.3f}, {dhi:+.3f}] -> {word}")
 
 
 # --------------------------------------------------------------------------
 # Chart
 # --------------------------------------------------------------------------
-def skill_chart(tables: Dict[str, pd.DataFrame], outcome: str, path: Path) -> None:
+def skill_chart(tables: Dict[str, pd.DataFrame], outcome: str, path: Path,
+                xlabel: str = "Skill vs climatology  (0 = no better than average, <0 = worse)",
+                title: str = "Out-of-sample forecast skill") -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -283,8 +296,7 @@ def skill_chart(tables: Dict[str, pd.DataFrame], outcome: str, path: Path) -> No
         ax.set_yticklabels(order, fontsize=9, color=ink)
         ax.tick_params(axis="x", colors=ink2, labelsize=9)
         ax.set_title(title, loc="left", fontsize=11, fontweight="bold", color=ink)
-        ax.set_xlabel("Skill vs climatology  (0 = no better than average, <0 = worse)",
-                      fontsize=9, color=ink2)
+        ax.set_xlabel(xlabel, fontsize=9, color=ink2)
         for s in ("top", "right", "left"):
             ax.spines[s].set_visible(False)
         ax.spines["bottom"].set_color("#cfcec9")
@@ -303,7 +315,7 @@ def skill_chart(tables: Dict[str, pd.DataFrame], outcome: str, path: Path) -> No
                         va="center", fontsize=8, color=ink2)
     handles = [Patch(color=GROUP_COLORS[g], label=GROUP_LABELS[g]) for g in GROUP_ORDER]
     fig.legend(handles=handles, loc="lower center", ncol=4, frameon=False, fontsize=9)
-    fig.suptitle(f"Out-of-sample forecast skill: {outcome}", x=0.01, ha="left",
+    fig.suptitle(f"{title}: {outcome}", x=0.01, ha="left",
                  fontsize=13, fontweight="bold", color=ink)
     fig.tight_layout(rect=(0, 0.06, 1, 0.95))
     fig.savefig(path, dpi=150, facecolor=surface)
@@ -313,9 +325,8 @@ def skill_chart(tables: Dict[str, pd.DataFrame], outcome: str, path: Path) -> No
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
-def run(outcome: str) -> None:
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+def add_common_args(ap: argparse.ArgumentParser) -> None:
+    """Command-line options shared by the regression and the logistic scripts."""
     ap.add_argument("--pcmci-dir", default=str(DEFAULT_PCMCI_DIR),
                     help="the PCMCI project folder (default: ../PCMCI)")
     ap.add_argument("--results-dir", default=str(HERE / "results"))
@@ -327,8 +338,6 @@ def run(outcome: str) -> None:
                     help="all-features model uses lags 1..this (raised to the longest parent lag)")
     ap.add_argument("--drop", nargs="*", default=[],
                     help="variables to leave out of everything, e.g. --drop t2m")
-    ap.add_argument("--forest", action="store_true",
-                    help="also test random forests (needs scikit-learn)")
     ap.add_argument("--reselect", action="store_true",
                     help="re-run PCMCI+ on each training window to choose parents "
                          "(clean test; slower; needs tigramite)")
@@ -339,8 +348,11 @@ def run(outcome: str) -> None:
                     help="path to run-PCMCI.py (default: <pcmci-dir>/run-PCMCI.py)")
     ap.add_argument("--boot", type=int, default=1000, help="bootstrap resamples")
     ap.add_argument("--seed", type=int, default=0)
-    a = ap.parse_args()
 
+
+def prepare(outcome: str, a: argparse.Namespace, kind: str) -> Dict[str, Any]:
+    """Read the PCMCI files, make the time splits and choose the parents.
+    Shared by the regression scripts and the logistic scripts."""
     pcmci_dir = Path(a.pcmci_dir)
     out_dir = pcmci_dir / "output"
     pre_path = out_dir / f"preprocessed_{outcome}.csv"
@@ -349,8 +361,9 @@ def run(outcome: str) -> None:
         if not p.exists():
             sys.exit(f"{p} not found. Run PreProcessData.py and run-PCMCI.py first "
                      f"(looking in {out_dir}).")
-    results = Path(a.results_dir)
-    results.mkdir(parents=True, exist_ok=True)
+    results = Path(a.results_dir) / outcome / kind        # results/<outcome>/<kind>/
+    figures = results / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
 
     df = pd.read_csv(pre_path, parse_dates=["date"], index_col="date")
     df = df.drop(columns=a.drop, errors="ignore")
@@ -421,6 +434,26 @@ def run(outcome: str) -> None:
             cache[key] = np.column_stack(cols) if cols else np.empty((len(df), 0))
         return cache[key]
 
+    return dict(df=df, links=links, predictors=predictors, dates=dates, years=years,
+                folds=folds, fold_parents=fold_parents, fold_same=fold_same,
+                all_lag=all_lag, valid=valid, y=y, design=design, results=results,
+                figures=figures, pcmci_dir=pcmci_dir, out_dir=out_dir)
+
+
+def run(outcome: str) -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_common_args(ap)
+    ap.add_argument("--forest", action="store_true",
+                    help="also test random forests (needs scikit-learn)")
+    a = ap.parse_args()
+    ctx = prepare(outcome, a, "regression")
+    df, predictors, dates, years = ctx["df"], ctx["predictors"], ctx["dates"], ctx["years"]
+    folds, fold_parents, fold_same = ctx["folds"], ctx["fold_parents"], ctx["fold_same"]
+    all_lag, valid, y, design, results = (ctx["all_lag"], ctx["valid"], ctx["y"],
+                                          ctx["design"], ctx["results"])
+    figures = ctx["figures"]
+
     persist = df[outcome].shift(1).to_numpy(dtype=float)
 
     # ---- fit and predict, fold by fold
@@ -485,15 +518,25 @@ def run(outcome: str) -> None:
             print(f"\n  Diagnostics, {label.lower()} (each parent alone / one removed):")
             print(dtab[["model", "skill", "skill_lo", "skill_hi"]].to_string(
                 index=False, float_format=lambda v: f"{v:+.3f}"))
-        tab.to_csv(results / f"{outcome}_skill_{'spring' if 'season' in label else 'all'}.csv",
+        tab.to_csv(results / f"skill_{'spring' if 'season' in label else 'all_months'}.csv",
                    index=False)
 
     pd.DataFrame(preds, index=df.index).assign(observed=y)[tested].to_csv(
-        results / f"{outcome}_predictions.csv")
+        results / "predictions.csv")
     pd.DataFrame([{"test_block": f"{ys}-{ye}",
                    "lagged_parents": "; ".join(f"{v}(t-{k})" for v, k in par),
                    "same_month_neighbors": "; ".join(same)}
                   for (ys, ye), par, same in zip(folds, fold_parents, fold_same)]
-                 ).to_csv(results / f"{outcome}_parents_by_fold.csv", index=False)
-    skill_chart(tables, outcome, results / f"{outcome}_skill.png")
-    print(f"\nWrote tables and chart to {results}")
+                 ).to_csv(results / "parents_by_fold.csv", index=False)
+    skill_chart(tables, outcome, figures / "skill_summary.png")
+
+    # ---- chart: observed vs predicted, one panel per model
+    models = plots.pick_models(preds, CLIM, (CAUSAL_OWN, CAUSAL), ALLF, NOWCAST)
+    skills = {}
+    if "All months" in tables:
+        skills = dict(zip(tables["All months"]["model"], tables["All months"]["skill"]))
+    t_dates = pd.DatetimeIndex(dates[tested])
+    t_preds = {m: preds[m][tested] for m in models}
+    plots.timeline_regression(figures / "observed_vs_predicted.png", t_dates, y[tested],
+                              t_preds, models, groups, skills, outcome)
+    print(f"\nWrote tables to {results} and charts to {figures}")

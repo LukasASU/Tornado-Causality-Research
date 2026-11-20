@@ -1,0 +1,6 @@
+test_block,lagged_parents,same_month_neighbors
+2002-2006,shear(t-3),cape; precip; shear
+2007-2011,shear(t-3),cape; precip; shear
+2012-2016,shear(t-3),cape; precip; shear
+2017-2021,shear(t-3),cape; precip; shear
+2022-2024,shear(t-3),cape; precip; shear
